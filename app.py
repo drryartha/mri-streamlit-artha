@@ -239,7 +239,7 @@ with tab_pred:
 
         img = Image.open(uploaded) if uploaded is not None else None
         if img is not None:
-            st.image(img, caption="Uploaded image", use_container_width=True)
+            st.image(img, caption="Uploaded image", use_column_width=True)
 
     with right:
         st.markdown('<div class="card">', unsafe_allow_html=True)
@@ -330,3 +330,4 @@ Fitur:
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.caption("© Brain Tumor MRI Classification")
+
