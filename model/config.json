@@ -1,0 +1,35 @@
+{
+  "created_at": "2026-01-19T12:43:29.693235",
+  "seed": 42,
+  "img_size": [
+    240,
+    240
+  ],
+  "batch_size": 32,
+  "num_classes": 4,
+  "class_names": [
+    "glioma",
+    "meningioma",
+    "notumor",
+    "pituitary"
+  ],
+  "model_family": "MobileNetV3Large",
+  "weights": "imagenet",
+  "stage": "stage1_frozen_backbone",
+  "preprocess": "tensorflow.keras.applications.mobilenet_v3.preprocess_input",
+  "loss": "sparse_categorical_crossentropy",
+  "optimizer": "Adam",
+  "lr": 0.001,
+  "val_split": 0.1,
+  "dataset_note": "FAIR: train/val from Training, test from Testing; stratified val split",
+  "augment": {
+    "RandomFlip": "horizontal",
+    "RandomRotation": 0.03,
+    "RandomZoom": 0.03
+  },
+  "metrics_last": {
+    "test_loss": 0.2275761514902115,
+    "test_acc": 0.9115179181098938,
+    "sklearn_acc": 0.9115179252479023
+  }
+}
