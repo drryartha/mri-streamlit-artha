@@ -7,15 +7,20 @@ import os, json
 # =========================
 # CONFIG
 # =========================
-# ✅ GANTI PATH INI sesuai file terbaru kamu (MobileNetV3Large)
 MODEL_PATH  = "model/cnn_brain_tumor.keras"
 CLASS_PATH  = "model/class_names.json"
 CONFIG_PATH = "model/config.json"
 
-# Heuristic OOD gate (MRI) - saringan kasar
+# Heuristic OOD gate (basic)
 EDGE_DENSITY_MAX = 0.30
 CONTRAST_MIN = 0.03
 CONTRAST_MAX = 0.35
+
+# ✅ Stronger OOD reject (no retrain)
+REJECT_CONF   = 0.60   # confidence final minimum
+REJECT_MARGIN = 0.10   # top1-top2 minimum
+REJECT_AGR    = 0.60   # crop agreement minimum
+REJECT_ENTROPY = 0.75  # normalized entropy maximum (higher = more uncertain)
 
 st.set_page_config(page_title="Brain Tumor MRI Classification", page_icon="🧠", layout="wide")
 
@@ -61,7 +66,6 @@ def load_assets():
     img_size = tuple(cfg["img_size"])
     num_classes = len(class_names)
 
-    # --- sanity checks (anti mismatch) ---
     if "num_classes" in cfg and int(cfg["num_classes"]) != num_classes:
         raise ValueError(f"num_classes mismatch: cfg={cfg['num_classes']} vs class_names={num_classes}")
 
@@ -69,7 +73,6 @@ def load_assets():
     if out_units != num_classes:
         raise ValueError(f"Model output units ({out_units}) != len(class_names) ({num_classes})")
 
-    # Warm-up (hindari error "never been called")
     dummy = tf.zeros((1, img_size[0], img_size[1], 3), dtype=tf.float32)
     _ = model(dummy, training=False)
 
@@ -83,10 +86,7 @@ model, CLASS_NAMES, IMG_SIZE, NUM_CLASSES, CFG = load_assets()
 def preprocess_image(img: Image.Image) -> np.ndarray:
     img = img.convert("RGB").resize(IMG_SIZE)
     arr = np.array(img).astype(np.float32)
-
-    # ✅ WAJIB: sama seperti training MobileNetV3Large
-    arr = mnv3_preprocess(arr)
-
+    arr = mnv3_preprocess(arr)          # ✅ must match training
     return np.expand_dims(arr, axis=0)
 
 # =========================
@@ -94,7 +94,7 @@ def preprocess_image(img: Image.Image) -> np.ndarray:
 # =========================
 def input_gate_metrics(img: Image.Image):
     """
-    Heuristic check to reduce misleading predictions on non-MRI images.
+    Basic MRI-ish heuristic filter.
     Returns: (is_ok, edge_density, contrast)
     """
     im = img.convert("RGB").resize((256, 256))
@@ -110,7 +110,7 @@ def input_gate_metrics(img: Image.Image):
     return is_ok, edge_density, contrast
 
 # =========================
-# MULTI-CROP INFERENCE (SOFTMAX)
+# MULTI-CROP
 # =========================
 def get_five_crop_boxes(W: int, H: int, scale: float = 0.85):
     s = int(min(W, H) * scale)
@@ -132,7 +132,8 @@ def predict_multi_crop_softmax(model, img: Image.Image, crop_scale: float = 0.85
     """
     Returns:
       pred_idx, probs_mean, conf_final,
-      probs_per_crop, boxes, agreement, best_crop_index, top2
+      probs_per_crop, boxes, agreement, best_crop_index, top2,
+      margin, entropy_norm
     """
     img = img.convert("RGB")
     W, H = img.size
@@ -145,7 +146,7 @@ def predict_multi_crop_softmax(model, img: Image.Image, crop_scale: float = 0.85
     for b in boxes:
         crop = img.crop(b)
         x = preprocess_image(crop)
-        p = np.array(model.predict(x, verbose=0)[0], dtype=np.float32)  # softmax (C,)
+        p = np.array(model.predict(x, verbose=0)[0], dtype=np.float32)  # (C,)
         probs_per_crop.append(p)
         pred_per_crop.append(int(np.argmax(p)))
         maxprob_per_crop.append(float(np.max(p)))
@@ -168,7 +169,15 @@ def predict_multi_crop_softmax(model, img: Image.Image, crop_scale: float = 0.85
     top2_idx = probs_mean.argsort()[-2:][::-1]
     top2 = [(int(i), float(probs_mean[i])) for i in top2_idx]
 
-    return pred_idx, probs_mean, conf_final, probs_per_crop, boxes, agreement, best_crop_index, top2
+    # ✅ margin (top1 - top2)
+    margin = float(top2[0][1] - top2[1][1])
+
+    # ✅ normalized entropy 0..1 (higher = more uncertain)
+    eps = 1e-8
+    entropy = float(-np.sum(probs_mean * np.log(probs_mean + eps)))
+    entropy_norm = float(entropy / np.log(len(probs_mean) + eps))
+
+    return pred_idx, probs_mean, conf_final, probs_per_crop, boxes, agreement, best_crop_index, top2, margin, entropy_norm
 
 # =========================
 # CONFIDENCE LABEL
@@ -191,6 +200,23 @@ def render_confidence_badge(conf: float, agreement: float):
         st.error(f"Confidence: **{level}** — {desc}")
 
 # =========================
+# REJECT DECISION (OOD)
+# =========================
+def should_reject(conf_final: float, agreement: float, margin: float, entropy_norm: float) -> bool:
+    """
+    Reject if input likely OOD / not brain MRI.
+    """
+    if conf_final < REJECT_CONF:
+        return True
+    if agreement < REJECT_AGR:
+        return True
+    if margin < REJECT_MARGIN:
+        return True
+    if entropy_norm > REJECT_ENTROPY:
+        return True
+    return False
+
+# =========================
 # APP HEADER
 # =========================
 st.markdown('<div class="title">🧠 Brain Tumor MRI Classification</div>', unsafe_allow_html=True)
@@ -200,26 +226,23 @@ st.markdown(
 )
 
 # =========================
-# SIDEBAR (tanpa explainable)
+# SIDEBAR
 # =========================
 with st.sidebar:
     st.markdown("## Panduan Singkat")
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
-
     st.write("1) Upload gambar MRI otak (jpg/png).")
     st.write("2) Lihat hasil prediksi & tingkat keyakinan.")
-
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
     st.markdown("## Tips Upload")
     st.write("• Gunakan citra MRI otak (bukan foto orang/objek umum).")
     st.write("• Usahakan gambar jelas, tidak terlalu blur/gelap.")
     st.write("• Jika hasil tidak masuk akal, coba gambar MRI lain (kontras dataset bisa berbeda).")
-
     st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
     st.caption("Disclaimer: Aplikasi ini bukan alat diagnosis klinis.")
 
 # =========================
-# TABS (tanpa Explain)
+# TABS
 # =========================
 tab_pred, tab_model, tab_about = st.tabs(["🔮 Predict", "📌 Model", "ℹ️ About"])
 
@@ -256,42 +279,57 @@ with tab_pred:
                 st.error("Gambar ini terlihat tidak seperti MRI otak (heuristic gate). Silakan upload MRI otak.")
                 st.session_state.last_result = None
             else:
-                pred_idx, probs_mean, conf, probs_per_crop, boxes, agreement, best_i, top2 = predict_multi_crop_softmax(
+                (pred_idx, probs_mean, conf, probs_per_crop, boxes, agreement,
+                 best_i, top2, margin, entropy_norm) = predict_multi_crop_softmax(
                     model, img, crop_scale=0.85
                 )
 
-                pred_label = CLASS_NAMES[pred_idx]
-                st.markdown(f'<span class="pill">Prediction: <b>{pred_label}</b></span>', unsafe_allow_html=True)
-                st.write("")
+                # ✅ OOD reject layer (no retrain)
+                reject = should_reject(conf, agreement, margin, entropy_norm)
 
-                render_confidence_badge(conf, agreement)
-                st.caption(f"Crop agreement: **{agreement*100:.1f}%**")
+                st.caption(
+                    f"OOD signals — agreement: `{agreement:.2f}` | margin(top1-top2): `{margin:.3f}` | entropy: `{entropy_norm:.3f}`"
+                )
 
-                st.markdown("**Top-2 classes (mean prob):**")
-                st.write(f"1) **{CLASS_NAMES[top2[0][0]]}** — `{top2[0][1]:.4f}`")
-                st.write(f"2) **{CLASS_NAMES[top2[1][0]]}** — `{top2[1][1]:.4f}`")
+                if reject:
+                    st.error("❌ Input kemungkinan **di luar cakupan** (bukan MRI otak / OOD). "
+                             "Silakan upload citra MRI otak yang valid.")
+                    st.session_state.last_result = None
+                else:
+                    pred_label = CLASS_NAMES[pred_idx]
+                    st.markdown(f'<span class="pill">Prediction: <b>{pred_label}</b></span>', unsafe_allow_html=True)
+                    st.write("")
 
-                st.markdown("**All class probabilities (mean):**")
-                st.json({CLASS_NAMES[i]: float(probs_mean[i]) for i in range(NUM_CLASSES)})
+                    render_confidence_badge(conf, agreement)
+                    st.caption(f"Crop agreement: **{agreement*100:.1f}%**")
 
-                st.write("Confidence:")
-                st.progress(int(conf * 100))
-                st.caption(f"{conf*100:.1f}%")
+                    st.markdown("**Top-2 classes (mean prob):**")
+                    st.write(f"1) **{CLASS_NAMES[top2[0][0]]}** — `{top2[0][1]:.4f}`")
+                    st.write(f"2) **{CLASS_NAMES[top2[1][0]]}** — `{top2[1][1]:.4f}`")
 
-                st.write(f"Per-crop probability for predicted class (**{pred_label}**):")
-                per_crop_pred = [float(p[pred_idx]) for p in probs_per_crop]
-                st.bar_chart({"p_predicted_class_per_crop": per_crop_pred})
+                    st.markdown("**All class probabilities (mean):**")
+                    st.json({CLASS_NAMES[i]: float(probs_mean[i]) for i in range(NUM_CLASSES)})
 
-                st.session_state.last_result = {
-                    "img": img,
-                    "pred_idx": pred_idx,
-                    "probs_mean": probs_mean,
-                    "conf": conf,
-                    "agreement": agreement,
-                    "boxes": boxes,
-                    "best_i": best_i,
-                    "top2": top2
-                }
+                    st.write("Confidence:")
+                    st.progress(int(conf * 100))
+                    st.caption(f"{conf*100:.1f}%")
+
+                    st.write(f"Per-crop probability for predicted class (**{pred_label}**):")
+                    per_crop_pred = [float(p[pred_idx]) for p in probs_per_crop]
+                    st.bar_chart({"p_predicted_class_per_crop": per_crop_pred})
+
+                    st.session_state.last_result = {
+                        "img": img,
+                        "pred_idx": pred_idx,
+                        "probs_mean": probs_mean,
+                        "conf": conf,
+                        "agreement": agreement,
+                        "boxes": boxes,
+                        "best_i": best_i,
+                        "top2": top2,
+                        "margin": margin,
+                        "entropy": entropy_norm
+                    }
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -322,7 +360,8 @@ Aplikasi ini mengklasifikasikan citra MRI otak menjadi 4 kelas:
 
 Fitur:
 - Multi-crop inference (lebih stabil)
-- Confidence dari agreement + stability
+- Confidence berbasis agreement + stability
+- OOD reject (confidence + margin + entropy)
 """
     )
     st.markdown("#### Disclaimer")
@@ -330,4 +369,3 @@ Fitur:
     st.markdown("</div>", unsafe_allow_html=True)
 
 st.caption("© Brain Tumor MRI Classification")
-
